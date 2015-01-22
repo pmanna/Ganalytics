@@ -14,6 +14,9 @@
     #define GANLog(...)
 #endif
 
+//#define GAN_DEBUG		// Log call data
+#define SUPPORT_IOS_6	// Use NSURLConnection in place of iOS 7-only NSURLSession
+
 #define MAX_PAYLOAD_LENGTH 8192
 #define RETRY_INTERVAL 20   // in seconds
 
@@ -22,11 +25,18 @@
 @property (nonatomic, strong, readwrite) NSString *clientID;
 @property (nonatomic, strong, readwrite) NSString *userAgent;
 
+#ifdef SUPPORT_IOS_6
+@property (nonatomic, strong) NSOperationQueue	*queue;
+#else
 @property (nonatomic, strong) NSURLSession *session;
+#endif
 @property (nonatomic, strong) NSDictionary *defaultParameters;
 @property (nonatomic, strong) NSMutableDictionary *customDimensions;
 @property (nonatomic, strong) NSMutableDictionary *customMetrics;
 @property (nonatomic, strong) NSMutableDictionary *overrideParameters;
+@property (nonatomic, strong) NSMutableDictionary *pendingRequests;
+
+- (void)sendRequestWithParameters:(NSDictionary *)parameters date:(NSDate *)date;
 
 @end
 
@@ -47,6 +57,19 @@
     return sharedInstance;
 }
 
+- (NSString *)pendingRequestsPath
+{
+	static NSString	*cachePath;
+	
+	if (!cachePath) {
+		NSString	*cacheDir	= [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) lastObject];
+		
+		cachePath	= [cacheDir stringByAppendingPathComponent: @"Ganalytics.plist"];
+	}
+	
+	return cachePath;
+}
+
 - (instancetype)initWithTrackingID:(NSString *)trackingID {
     self = [super init];
     if (self) {
@@ -63,11 +86,16 @@
                           currentDevice.model,
                           currentDevice.systemVersion];
         
+#ifdef SUPPORT_IOS_6
+		self.queue		= [[NSOperationQueue alloc] init];
+		self.queue.name	= @"GanalyticsQueue";
+#else
         NSURLSessionConfiguration *configuration = [NSURLSessionConfiguration ephemeralSessionConfiguration];
         self.session = [NSURLSession sessionWithConfiguration:configuration
                                                      delegate:nil
                                                 delegateQueue:nil];
-        
+#endif
+		
         CGRect screenBounds = [UIScreen mainScreen].bounds;
         CGFloat screenScale = [UIScreen mainScreen].scale;
         self.defaultParameters = @{ @"v" : @1,
@@ -81,6 +109,36 @@
         self.customDimensions = [NSMutableDictionary dictionary];
         self.customMetrics = [NSMutableDictionary dictionary];
         self.overrideParameters = [NSMutableDictionary dictionary];
+		self.pendingRequests	= [NSMutableDictionary dictionary];
+		
+		NSNotificationCenter	*nc	= [NSNotificationCenter defaultCenter];
+		
+		// Listen for app termination, save pending requests on disk in case we have some
+		[nc addObserverForName: UIApplicationWillResignActiveNotification
+						object: nil
+						 queue: [NSOperationQueue currentQueue]
+					usingBlock: ^(NSNotification *note) {
+						// Save pending requests on disk for future sending
+						if (self.pendingRequests.count) {
+							GANLog(@"[%@] Save pending requests to disk", NSStringFromClass([self class]));
+							[self.pendingRequests writeToFile: [self pendingRequestsPath] atomically: YES];
+							self.pendingRequests	= nil;
+						}
+					}];
+		[nc addObserverForName: UIApplicationDidBecomeActiveNotification
+						object: nil
+						 queue: [NSOperationQueue currentQueue]
+					usingBlock: ^(NSNotification *note) {
+						NSFileManager			*df	= [NSFileManager defaultManager];
+						
+						// Load pending requests on disk that could be there
+						GANLog(@"[%@] Load pending requests from disk", NSStringFromClass([self class]));
+						if ([df fileExistsAtPath: [self pendingRequestsPath]]) {
+							// Read back pending requests and delete the file
+							self.pendingRequests	= [NSMutableDictionary dictionaryWithContentsOfFile: [self pendingRequestsPath]];
+							[df removeItemAtPath: [self pendingRequestsPath] error: nil];
+						}
+					}];
     }
     return self;
 }
@@ -162,17 +220,84 @@
         GANLog(@"[%@] The body must be no longer than %d bytes.", NSStringFromClass([self class]), MAX_PAYLOAD_LENGTH);
     }
     
-    GANLog(@"[%@] %@ %@ %@ DEBUG = %@", NSStringFromClass([self class]), request.HTTPMethod, request.URL, params, (self.debugMode ? @"YES" : @"NO"));
-    
+#ifdef GAN_DEBUG
+	GANLog(@"[%@] %@ %@ %@ DEBUG = %@", NSStringFromClass([self class]), request.HTTPMethod, request.URL, params, (self.debugMode ? @"YES" : @"NO"));
+#endif
+	
     if (!self.debugMode) {
+#ifdef SUPPORT_IOS_6
+		dispatch_queue_t current_queue	= dispatch_get_current_queue();
+		
+		[NSURLConnection sendAsynchronousRequest: [self requestWithParameters:params]
+										   queue: self.queue
+							   completionHandler: ^(NSURLResponse *response, NSData *data, NSError *connectionError) {
+								   if (connectionError) {
+									   NSInteger	errorCode	= connectionError.code;
+									   
+									   if (errorCode == NSURLErrorNotConnectedToInternet) {
+										   // No connection, doesn't make sense retrying, store the request for later use
+										   GANLog(@"[%@] No connection, storing request %@.", NSStringFromClass([self class]), parameters);
+										   [self.pendingRequests setObject: parameters
+																	forKey: [@([date timeIntervalSinceReferenceDate]) stringValue]];
+									   } else {
+										   // Internet is on, may have timed out, retry in a bit
+										   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(RETRY_INTERVAL * NSEC_PER_SEC)), current_queue, ^{
+											   [self sendRequestWithParameters:parameters date:date];
+										   });
+									   }
+								   } else {
+									   // If we had a successful connection, and have previous calls pending, re-queue them
+									   if (self.pendingRequests.count) {
+										   for (NSString *aKey in self.pendingRequests.allKeys) {
+											   NSDate				*aDate		= [NSDate dateWithTimeIntervalSinceReferenceDate: [aKey doubleValue]];
+											   NSMutableDictionary	*paramDict	= [NSMutableDictionary dictionaryWithDictionary: self.pendingRequests[aKey]];
+											   
+											   GANLog(@"[%@] Re-queueing stored request %@.", NSStringFromClass([self class]), paramDict);
+											   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(RETRY_INTERVAL * NSEC_PER_SEC)), current_queue, ^{
+												   [self sendRequestWithParameters: paramDict date: aDate];
+											   });
+										   }
+										   
+										   // Removing pending requests, as they've been re-queued already
+										   [self.pendingRequests removeAllObjects];
+									   }
+								   }
+							   }];
+#else
         [[self.session dataTaskWithRequest:[self requestWithParameters:params]
                          completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
                              if (error) {
-                                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(RETRY_INTERVAL * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                                     [self sendRequestWithParameters:parameters date:date];
-                                 });
-                             }
+								 NSInteger	errorCode	= error.code;
+								 
+								 if (errorCode == NSURLErrorNotConnectedToInternet) {
+									 // No connection, doesn't make sense retrying, store the request for later use
+									 GANLog(@"[%@] No connection, storing request %@.", NSStringFromClass([self class]), parameters);
+									 [self.pendingRequests setObject: parameters
+															  forKey: [@([date timeIntervalSinceReferenceDate]) stringValue]];
+								 } else {
+									 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(RETRY_INTERVAL * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+										 [self sendRequestWithParameters:parameters date:date];
+									 });
+								 }
+							 } else {
+								 // If we had a successful connection, and have previous calls pending, re-queue them
+								 if (self.pendingRequests.count) {
+									 for (NSString *aKey in self.pendingRequests.allKeys) {
+										 NSDate				*aDate		= [NSDate dateWithTimeIntervalSinceReferenceDate: [aKey doubleValue]];
+										 NSMutableDictionary	*paramDict	= [NSMutableDictionary dictionaryWithDictionary: self.pendingRequests[aKey]];
+										 
+										 GANLog(@"[%@] Re-queueing stored request %@.", NSStringFromClass([self class]), paramDict);
+										 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(RETRY_INTERVAL * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+											 [self sendRequestWithParameters: paramDict date: aDate];
+										 });
+									 }
+									 
+									 // Removing pending requests, as they've been re-queued already
+									 [self.pendingRequests removeAllObjects];
+								 }
+                            }
                          }] resume];
+#endif
     }
 }
 

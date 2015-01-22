@@ -25,6 +25,8 @@ typedef NS_ENUM(NSInteger, GANDefaultParameter) {
 
 - (instancetype)initWithTrackingID:(NSString *)trackingID NS_DESIGNATED_INITIALIZER;
 
+- (void)sendRequestWithParameters:(NSDictionary *)parameters;
+
 - (void)sendEventWithCategory:(NSString *)category  // required
                        action:(NSString *)action    // required
                         label:(NSString *)label     // optional
