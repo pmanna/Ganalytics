@@ -15,28 +15,40 @@
 #endif
 
 //#define GAN_DEBUG		// Log call data
-#define SUPPORT_IOS_6	// Use NSURLConnection in place of iOS 7-only NSURLSession
+//#define SUPPORT_IOS_6	// Use NSURLConnection in place of iOS 7-only NSURLSession
 
 #define MAX_PAYLOAD_LENGTH 8192
-#define RETRY_INTERVAL 20   // in seconds
+// interval between the request posting, in seconds
+// Official Google SDK has event throttling, then a limit to throughput is desirable,
+// even though we try to avoid dropping any event
+// (see https://developers.google.com/analytics/devguides/collection/other/limits-quotas#client_libs_sdks )
+#define QUEUE_INTERVAL 1.0
 
-@interface Ganalytics () <NSURLSessionDelegate>
+@interface Ganalytics ()
 
 @property (nonatomic, strong, readwrite) NSString *clientID;
 @property (nonatomic, strong, readwrite) NSString *userAgent;
 
-#ifdef SUPPORT_IOS_6
-@property (nonatomic, strong) NSOperationQueue	*queue;
-#else
+#ifndef SUPPORT_IOS_6
 @property (nonatomic, strong) NSURLSession *session;
 #endif
 @property (nonatomic, strong) NSDictionary *defaultParameters;
 @property (nonatomic, strong) NSMutableDictionary *customDimensions;
 @property (nonatomic, strong) NSMutableDictionary *customMetrics;
 @property (nonatomic, strong) NSMutableDictionary *overrideParameters;
-@property (nonatomic, strong) NSMutableDictionary *pendingRequests;
+@property (nonatomic, strong) NSMutableArray *pendingRequests;
+@property (nonatomic, strong) NSTimer *queueTimer;
+@property (assign, getter=isSending) BOOL sending;
 
 - (void)sendRequestWithParameters:(NSDictionary *)parameters date:(NSDate *)date;
+- (void)pickRequestFromQueue: (NSTimer *)aTimer;
+- (NSURL *)endpointURL;
+- (NSURLRequest *)requestWithParameters:(NSDictionary *)parameters;
+
+// Persistence methods
+- (NSString *)pendingRequestsPath;
+- (void)savePendingRequests;
+- (void)loadPendingRequests;
 
 @end
 
@@ -57,19 +69,6 @@
     return sharedInstance;
 }
 
-- (NSString *)pendingRequestsPath
-{
-	static NSString	*cachePath;
-	
-	if (!cachePath) {
-		NSString	*cacheDir	= [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) lastObject];
-		
-		cachePath	= [cacheDir stringByAppendingPathComponent: @"Ganalytics.plist"];
-	}
-	
-	return cachePath;
-}
-
 - (instancetype)initWithTrackingID:(NSString *)trackingID {
     self = [super init];
     if (self) {
@@ -86,14 +85,11 @@
                           currentDevice.model,
                           currentDevice.systemVersion];
         
-#ifdef SUPPORT_IOS_6
-		self.queue		= [[NSOperationQueue alloc] init];
-		self.queue.name	= @"GanalyticsQueue";
-#else
+#ifndef SUPPORT_IOS_6
         NSURLSessionConfiguration *configuration = [NSURLSessionConfiguration ephemeralSessionConfiguration];
-        self.session = [NSURLSession sessionWithConfiguration:configuration
-                                                     delegate:nil
-                                                delegateQueue:nil];
+        self.session = [NSURLSession sessionWithConfiguration: configuration
+                                                     delegate: nil
+                                                delegateQueue: [NSOperationQueue currentQueue]];
 #endif
 		
         CGRect screenBounds = [UIScreen mainScreen].bounds;
@@ -106,38 +102,34 @@
                                     @"ul" : [NSLocale preferredLanguages].firstObject,
                                     @"sr" : [NSString stringWithFormat:@"%.0fx%.0f@%.fx", CGRectGetWidth(screenBounds), CGRectGetHeight(screenBounds), screenScale]};
         
-        self.customDimensions = [NSMutableDictionary dictionary];
-        self.customMetrics = [NSMutableDictionary dictionary];
+        self.customDimensions	= [NSMutableDictionary dictionary];
+        self.customMetrics		= [NSMutableDictionary dictionary];
         self.overrideParameters = [NSMutableDictionary dictionary];
-		self.pendingRequests	= [NSMutableDictionary dictionary];
+		
+		// Loads pending requests, if any, and starts queue timer
+		[self loadPendingRequests];
 		
 		NSNotificationCenter	*nc	= [NSNotificationCenter defaultCenter];
 		
-		// Listen for app termination, save pending requests on disk in case we have some
+		// Listen for app suspend, save pending requests on disk in case we have some
 		[nc addObserverForName: UIApplicationWillResignActiveNotification
 						object: nil
 						 queue: [NSOperationQueue currentQueue]
 					usingBlock: ^(NSNotification *note) {
-						// Save pending requests on disk for future sending
-						if (self.pendingRequests.count) {
-							GANLog(@"[%@] Save pending requests to disk", NSStringFromClass([self class]));
-							[self.pendingRequests writeToFile: [self pendingRequestsPath] atomically: YES];
-							self.pendingRequests	= nil;
-						}
+#ifdef SUPPORT_IOS_6
+						[self savePendingRequests];
+#else
+						[self.session flushWithCompletionHandler:^{
+							[self savePendingRequests];
+						}];
+#endif
 					}];
+		// Listen for app resume, load pending requests from disk in case we have some
 		[nc addObserverForName: UIApplicationDidBecomeActiveNotification
 						object: nil
 						 queue: [NSOperationQueue currentQueue]
 					usingBlock: ^(NSNotification *note) {
-						NSFileManager			*df	= [NSFileManager defaultManager];
-						
-						// Load pending requests on disk that could be there
-						GANLog(@"[%@] Load pending requests from disk", NSStringFromClass([self class]));
-						if ([df fileExistsAtPath: [self pendingRequestsPath]]) {
-							// Read back pending requests and delete the file
-							self.pendingRequests	= [NSMutableDictionary dictionaryWithContentsOfFile: [self pendingRequestsPath]];
-							[df removeItemAtPath: [self pendingRequestsPath] error: nil];
-						}
+						[self loadPendingRequests];
 					}];
     }
     return self;
@@ -203,6 +195,69 @@
     [self sendRequestWithParameters:parameters];
 }
 
+- (void)sendView:(NSString *)screenName {
+	NSParameterAssert(screenName);
+	
+	NSMutableDictionary *parameters = @{ @"t" : @"screenview",
+										 @"cd" : screenName }.mutableCopy;
+	
+	[self sendRequestWithParameters:parameters];
+	
+}
+
+- (void)setCustomDimensionAtIndex:(NSInteger)index
+							value:(NSString *)value {
+	NSParameterAssert(value);
+	
+	if (index < 1 || index > 200) {
+		GANLog(@"[%@] The index for custom dimensions must be between 1 and 200 (inclusive).", NSStringFromClass([self class]));
+	} else {
+		NSString *key = [NSString stringWithFormat:@"cd%ld", (long)index];
+		self.customDimensions[key] = value;
+	}
+}
+
+- (void)setCustomMetricAtIndex:(NSInteger)index
+						 value:(NSInteger)value {
+	if (index < 1 || index > 200) {
+		GANLog(@"[%@] The index for custom metrics must be between 1 and 200 (inclusive).", NSStringFromClass([self class]));
+	} else {
+		NSString *key = [NSString stringWithFormat:@"cm%ld", (long)index];
+		self.customMetrics[key] = [NSString stringWithFormat:@"%ld", (long)value];
+	}
+}
+
+- (void)setValue:(id)value forDefaultParameter:(GANDefaultParameter)parameter {
+	NSString *key = nil;
+	switch (parameter) {
+		case GANApplicationID:
+			key = @"aid";
+			break;
+		case GANApplicationName:
+			key = @"an";
+			break;
+		case GANApplicationVersion:
+			key = @"av";
+			break;
+		default:
+			break;
+	}
+	
+	if (key) {
+		if (value) {
+			self.overrideParameters[key] = value;
+		} else {
+			[self.overrideParameters removeObjectForKey:key];
+		}
+	}
+}
+
+- (void)sendRequestWithParameters:(NSDictionary *)parameters {
+	[self.pendingRequests addObject: parameters];
+}
+
+#pragma mark - Private methods
+
 - (void)sendRequestWithParameters:(NSDictionary *)parameters date:(NSDate *)date {
     NSParameterAssert(date);
     NSAssert(self.trackingID, @"trackingID cannot be nil");
@@ -226,140 +281,39 @@
 	
     if (!self.debugMode) {
 #ifdef SUPPORT_IOS_6
-		dispatch_queue_t current_queue	= dispatch_get_current_queue();
-		
 		[NSURLConnection sendAsynchronousRequest: [self requestWithParameters:params]
-										   queue: self.queue
+										   queue: [NSOperationQueue currentQueue]
 							   completionHandler: ^(NSURLResponse *response, NSData *data, NSError *connectionError) {
-								   if (connectionError) {
-									   NSInteger	errorCode	= connectionError.code;
-									   
-									   if (errorCode == NSURLErrorNotConnectedToInternet) {
-										   // No connection, doesn't make sense retrying, store the request for later use
-										   GANLog(@"[%@] No connection, storing request %@.", NSStringFromClass([self class]), parameters);
-										   [self.pendingRequests setObject: parameters
-																	forKey: [@([date timeIntervalSinceReferenceDate]) stringValue]];
-									   } else {
-										   // Internet is on, may have timed out, retry in a bit
-										   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(RETRY_INTERVAL * NSEC_PER_SEC)), current_queue, ^{
-											   [self sendRequestWithParameters:parameters date:date];
-										   });
-									   }
-								   } else {
-									   // If we had a successful connection, and have previous calls pending, re-queue them
-									   if (self.pendingRequests.count) {
-										   for (NSString *aKey in self.pendingRequests.allKeys) {
-											   NSDate				*aDate		= [NSDate dateWithTimeIntervalSinceReferenceDate: [aKey doubleValue]];
-											   NSMutableDictionary	*paramDict	= [NSMutableDictionary dictionaryWithDictionary: self.pendingRequests[aKey]];
-											   
-											   GANLog(@"[%@] Re-queueing stored request %@.", NSStringFromClass([self class]), paramDict);
-											   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(RETRY_INTERVAL * NSEC_PER_SEC)), current_queue, ^{
-												   [self sendRequestWithParameters: paramDict date: aDate];
-											   });
-										   }
-										   
-										   // Removing pending requests, as they've been re-queued already
-										   [self.pendingRequests removeAllObjects];
-									   }
-								   }
+								   if (!connectionError)
+									   [self.pendingRequests removeObjectAtIndex: 0];
+								   
+								   self.sending	= NO;
 							   }];
 #else
         [[self.session dataTaskWithRequest:[self requestWithParameters:params]
-                         completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-                             if (error) {
-								 NSInteger	errorCode	= error.code;
-								 
-								 if (errorCode == NSURLErrorNotConnectedToInternet) {
-									 // No connection, doesn't make sense retrying, store the request for later use
-									 GANLog(@"[%@] No connection, storing request %@.", NSStringFromClass([self class]), parameters);
-									 [self.pendingRequests setObject: parameters
-															  forKey: [@([date timeIntervalSinceReferenceDate]) stringValue]];
-								 } else {
-									 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(RETRY_INTERVAL * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-										 [self sendRequestWithParameters:parameters date:date];
-									 });
-								 }
-							 } else {
-								 // If we had a successful connection, and have previous calls pending, re-queue them
-								 if (self.pendingRequests.count) {
-									 for (NSString *aKey in self.pendingRequests.allKeys) {
-										 NSDate				*aDate		= [NSDate dateWithTimeIntervalSinceReferenceDate: [aKey doubleValue]];
-										 NSMutableDictionary	*paramDict	= [NSMutableDictionary dictionaryWithDictionary: self.pendingRequests[aKey]];
-										 
-										 GANLog(@"[%@] Re-queueing stored request %@.", NSStringFromClass([self class]), paramDict);
-										 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(RETRY_INTERVAL * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-											 [self sendRequestWithParameters: paramDict date: aDate];
-										 });
-									 }
-									 
-									 // Removing pending requests, as they've been re-queued already
-									 [self.pendingRequests removeAllObjects];
-								 }
-                            }
-                         }] resume];
+						 completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+							 if (!error)
+								 [self.pendingRequests removeObjectAtIndex: 0];
+							 
+							 self.sending	= NO;
+						 }] resume];
 #endif
-    }
+	} else {
+		self.sending	= NO;
+	}
 }
 
-- (void)sendRequestWithParameters:(NSDictionary *)parameters {
-    [self sendRequestWithParameters:parameters date:[NSDate date]];
-}
-
-- (void)sendView:(NSString *)screenName {
-    NSParameterAssert(screenName);
-    
-    NSMutableDictionary *parameters = @{ @"t" : @"screenview",
-                                         @"cd" : screenName }.mutableCopy;
-    
-    [self sendRequestWithParameters:parameters];
-
-}
-
-- (void)setCustomDimensionAtIndex:(NSInteger)index
-                            value:(NSString *)value {
-    NSParameterAssert(value);
-    
-    if (index < 1 || index > 200) {
-        GANLog(@"[%@] The index for custom dimensions must be between 1 and 200 (inclusive).", NSStringFromClass([self class]));
-    } else {
-        NSString *key = [NSString stringWithFormat:@"cd%ld", (long)index];
-        self.customDimensions[key] = value;
-    }
-}
-
-- (void)setCustomMetricAtIndex:(NSInteger)index
-                         value:(NSInteger)value {
-    if (index < 1 || index > 200) {
-        GANLog(@"[%@] The index for custom metrics must be between 1 and 200 (inclusive).", NSStringFromClass([self class]));
-    } else {
-        NSString *key = [NSString stringWithFormat:@"cm%ld", (long)index];
-        self.customMetrics[key] = [NSString stringWithFormat:@"%ld", (long)value];
-    }
-}
-
-- (void)setValue:(id)value forDefaultParameter:(GANDefaultParameter)parameter {
-    NSString *key = nil;
-    switch (parameter) {
-        case GANApplicationID:
-            key = @"aid";
-            break;
-        case GANApplicationName:
-            key = @"an";
-            break;
-        case GANApplicationVersion:
-            key = @"av";
-            break;
-        default:
-            break;
-    }
-    
-    if (key) {
-        if (value) {
-            self.overrideParameters[key] = value;
-        } else {
-            [self.overrideParameters removeObjectForKey:key];
-        }
-    }
+- (void)pickRequestFromQueue: (NSTimer *)aTimer
+{
+	// Do nothing if there are no pending requests or one is being sent already
+	if (!self.pendingRequests.count || self.isSending)
+		return;
+	
+	self.sending	= YES;
+	
+	NSDictionary	*parameters	= [self.pendingRequests objectAtIndex: 0];
+	
+	[self sendRequestWithParameters: parameters date: [NSDate date]];
 }
 
 - (NSURL *)endpointURL {
@@ -379,6 +333,59 @@
     [postRequest setHTTPBody:payload];
 
     return postRequest;
+}
+
+#pragma mark - Requests Persistence
+
+- (NSString *)pendingRequestsPath
+{
+	static NSString	*cachePath;
+	
+	if (!cachePath) {
+		NSString	*cacheDir	= [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) lastObject];
+		
+		cachePath	= [cacheDir stringByAppendingPathComponent: @"Ganalytics.plist"];
+	}
+	
+	return cachePath;
+}
+
+- (void)savePendingRequests
+{
+	// Save pending requests on disk for future sending, empty queue
+	if (self.pendingRequests.count) {
+		GANLog(@"[%@] Save pending requests to disk", NSStringFromClass([self class]));
+		
+		[self.pendingRequests writeToFile: [self pendingRequestsPath] atomically: YES];
+		self.pendingRequests	= nil;
+	}
+	
+	// Queue has been removed, stop timer
+	[self.queueTimer invalidate];	self.queueTimer	= nil;
+}
+
+- (void)loadPendingRequests
+{
+	NSFileManager			*df	= [NSFileManager defaultManager];
+	
+	// Load pending requests on disk that could be there
+	if ([df fileExistsAtPath: [self pendingRequestsPath]]) {
+		GANLog(@"[%@] Load pending requests from disk", NSStringFromClass([self class]));
+		
+		// Read back pending requests and delete the file
+		self.pendingRequests	= [NSMutableArray arrayWithContentsOfFile: [self pendingRequestsPath]];
+		[df removeItemAtPath: [self pendingRequestsPath] error: nil];
+	} else if (!self.pendingRequests) {
+		self.pendingRequests	= [NSMutableArray array];
+	}
+	
+	// Now that we have a queue to work on, start timer
+	if (!self.queueTimer)
+		self.queueTimer	= [NSTimer scheduledTimerWithTimeInterval: QUEUE_INTERVAL
+														   target: self
+														 selector: @selector(pickRequestFromQueue:)
+														 userInfo: nil
+														  repeats: YES];
 }
 
 @end

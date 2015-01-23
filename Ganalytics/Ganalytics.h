@@ -25,8 +25,6 @@ typedef NS_ENUM(NSInteger, GANDefaultParameter) {
 
 - (instancetype)initWithTrackingID:(NSString *)trackingID NS_DESIGNATED_INITIALIZER;
 
-- (void)sendRequestWithParameters:(NSDictionary *)parameters;
-
 - (void)sendEventWithCategory:(NSString *)category  // required
                        action:(NSString *)action    // required
                         label:(NSString *)label     // optional
@@ -50,5 +48,7 @@ typedef NS_ENUM(NSInteger, GANDefaultParameter) {
                          value:(NSInteger)value;
 
 - (void)setValue:(id)value forDefaultParameter:(GANDefaultParameter)parameter;  // use this method to override default parameters
+
+- (void)sendRequestWithParameters:(NSDictionary *)parameters;
 
 @end
