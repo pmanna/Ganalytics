@@ -14,24 +14,23 @@
     #define GANLog(...)
 #endif
 
+#define kSystemVersion [[[UIDevice currentDevice] systemVersion] floatValue]
+
 //#define GAN_DEBUG		// Log call data
-//#define SUPPORT_IOS_6	// Use NSURLConnection in place of iOS 7-only NSURLSession
 
 #define MAX_PAYLOAD_LENGTH 8192
 // interval between the request posting, in seconds
 // Official Google SDK has event throttling, then a limit to throughput is desirable,
 // even though we try to avoid dropping any event
 // (see https://developers.google.com/analytics/devguides/collection/other/limits-quotas#client_libs_sdks )
-#define QUEUE_INTERVAL 1.0
+#define QUEUE_INTERVAL 0.3
 
 @interface Ganalytics ()
 
 @property (nonatomic, strong, readwrite) NSString *clientID;
 @property (nonatomic, strong, readwrite) NSString *userAgent;
 
-#ifndef SUPPORT_IOS_6
 @property (nonatomic, strong) NSURLSession *session;
-#endif
 @property (nonatomic, strong) NSDictionary *defaultParameters;
 @property (nonatomic, strong) NSMutableDictionary *customDimensions;
 @property (nonatomic, strong) NSMutableDictionary *customMetrics;
@@ -84,13 +83,13 @@
                           infoDictionary[@"CFBundleShortVersionString"],
                           currentDevice.model,
                           currentDevice.systemVersion];
-        
-#ifndef SUPPORT_IOS_6
-        NSURLSessionConfiguration *configuration = [NSURLSessionConfiguration ephemeralSessionConfiguration];
-        self.session = [NSURLSession sessionWithConfiguration: configuration
-                                                     delegate: nil
-                                                delegateQueue: [NSOperationQueue currentQueue]];
-#endif
+		
+		if (kSystemVersion >= 7.0) {
+			NSURLSessionConfiguration *configuration = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+			self.session = [NSURLSession sessionWithConfiguration: configuration
+														 delegate: nil
+													delegateQueue: [NSOperationQueue currentQueue]];
+		}
 		
         CGRect screenBounds = [UIScreen mainScreen].bounds;
         CGFloat screenScale = [UIScreen mainScreen].scale;
@@ -109,27 +108,27 @@
 		// Loads pending requests, if any, and starts queue timer
 		[self loadPendingRequests];
 		
-		NSNotificationCenter	*nc	= [NSNotificationCenter defaultCenter];
+		NSNotificationCenter		*nc	= [NSNotificationCenter defaultCenter];
+		 __weak __typeof__(self)	wself	= self;
 		
 		// Listen for app suspend, save pending requests on disk in case we have some
 		[nc addObserverForName: UIApplicationWillResignActiveNotification
 						object: nil
 						 queue: [NSOperationQueue currentQueue]
 					usingBlock: ^(NSNotification *note) {
-#ifdef SUPPORT_IOS_6
-						[self savePendingRequests];
-#else
-						[self.session flushWithCompletionHandler:^{
-							[self savePendingRequests];
-						}];
-#endif
+						if (wself.session)
+							[wself.session flushWithCompletionHandler:^{
+								[wself savePendingRequests];
+							}];
+						else
+							[wself savePendingRequests];
 					}];
 		// Listen for app resume, load pending requests from disk in case we have some
 		[nc addObserverForName: UIApplicationDidBecomeActiveNotification
 						object: nil
 						 queue: [NSOperationQueue currentQueue]
 					usingBlock: ^(NSNotification *note) {
-						[self loadPendingRequests];
+						[wself loadPendingRequests];
 					}];
     }
     return self;
@@ -280,24 +279,23 @@
 #endif
 	
     if (!self.debugMode) {
-#ifdef SUPPORT_IOS_6
-		[NSURLConnection sendAsynchronousRequest: [self requestWithParameters:params]
-										   queue: [NSOperationQueue currentQueue]
-							   completionHandler: ^(NSURLResponse *response, NSData *data, NSError *connectionError) {
-								   if (!connectionError)
-									   [self.pendingRequests removeObjectAtIndex: 0];
-								   
-								   self.sending	= NO;
-							   }];
-#else
-        [[self.session dataTaskWithRequest:[self requestWithParameters:params]
-						 completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-							 if (!error)
-								 [self.pendingRequests removeObjectAtIndex: 0];
-							 
-							 self.sending	= NO;
-						 }] resume];
-#endif
+		if (self.session)
+			[[self.session dataTaskWithRequest: [self requestWithParameters:params]
+							 completionHandler: ^(NSData *data, NSURLResponse *response, NSError *error) {
+								 if (!error)
+									 [self.pendingRequests removeObjectAtIndex: 0];
+								 
+								 self.sending	= NO;
+							 }] resume];
+		else
+			[NSURLConnection sendAsynchronousRequest: [self requestWithParameters:params]
+											   queue: [NSOperationQueue currentQueue]
+								   completionHandler: ^(NSURLResponse *response, NSData *data, NSError *connectionError) {
+									   if (!connectionError)
+										   [self.pendingRequests removeObjectAtIndex: 0];
+									   
+									   self.sending	= NO;
+								   }];
 	} else {
 		self.sending	= NO;
 	}
