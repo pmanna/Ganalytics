@@ -77,6 +77,9 @@
         
         UIDevice *currentDevice = [UIDevice currentDevice];
         NSDictionary *infoDictionary = [[NSBundle mainBundle] infoDictionary];
+		
+		// WARN: This may return NULL on iOS 7, so ensure to request it later!
+		// http://stackoverflow.com/questions/22849932/identifierforvendor-for-uuidstring-returns-null
         self.clientID = currentDevice.identifierForVendor.UUIDString;
         self.userAgent = [NSString stringWithFormat:@"%@/%@ (%@; CPU OS %@ like Mac OS X)",
                           infoDictionary[@"CFBundleName"],
@@ -94,7 +97,6 @@
         CGRect screenBounds = [UIScreen mainScreen].bounds;
         CGFloat screenScale = [UIScreen mainScreen].scale;
         self.defaultParameters = @{ @"v" : @1,
-                                    @"cid" : self.clientID,
                                     @"aid" : infoDictionary[@"CFBundleIdentifier"],
                                     @"an" : infoDictionary[@"CFBundleName"],
                                     @"av" : infoDictionary[@"CFBundleShortVersionString"],
@@ -260,10 +262,16 @@
 - (void)sendRequestWithParameters:(NSDictionary *)parameters date:(NSDate *)date {
     NSParameterAssert(date);
     NSAssert(self.trackingID, @"trackingID cannot be nil");
-    
+	
+	// Request this again, iOS 7 bug, see above
+	if (!self.clientID)
+		self.clientID = [UIDevice currentDevice].identifierForVendor.UUIDString;
+	
     NSMutableDictionary *params = self.defaultParameters.mutableCopy;
     [params addEntriesFromDictionary:self.overrideParameters];
     [params setObject:self.trackingID forKey:@"tid"];
+	if (self.clientID)
+		[params setObject:self.clientID forKey:@"cid"];
     [params addEntriesFromDictionary:self.customDimensions];
     [params addEntriesFromDictionary:self.customMetrics];
     [params addEntriesFromDictionary:parameters];
