@@ -401,8 +401,13 @@
 - (NSString *)gan_queryString {
     NSMutableArray *parameters = [NSMutableArray array];
     for (id key in self) {
-        id value = [self objectForKey:key];
-        NSString *parameter = [[NSString stringWithFormat: @"%@=%@", key, value] stringByAddingPercentEscapesUsingEncoding:NSUTF8StringEncoding];
+		NSString	*value	= (__bridge_transfer NSString *)CFURLCreateStringByAddingPercentEscapes(kCFAllocatorDefault,
+																									(CFStringRef)[[self objectForKey: key] description],
+																									NULL,
+																									CFSTR("!*'();:@&=+$,/?%#[]"),
+																									kCFStringEncodingUTF8);
+		
+        NSString *parameter = [NSString stringWithFormat: @"%@=%@", key, value];
         [parameters addObject:parameter];
     }
     return [parameters componentsJoinedByString:@"&"];
