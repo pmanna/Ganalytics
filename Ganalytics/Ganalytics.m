@@ -7,6 +7,10 @@
 //
 
 #import "Ganalytics.h"
+#import <pthread.h>
+#ifdef SUPPORT_IDFA
+#import <AdSupport/AdSupport.h>
+#endif
 
 #ifdef DEBUG
     #define GANLog NSLog
@@ -25,10 +29,13 @@
 // (see https://developers.google.com/analytics/devguides/collection/other/limits-quotas#client_libs_sdks )
 #define QUEUE_INTERVAL 0.3
 
-@interface Ganalytics ()
+@interface Ganalytics () {
+	pthread_mutex_t	mutex;
+}
 
 @property (nonatomic, strong, readwrite) NSString *clientID;
 @property (nonatomic, strong, readwrite) NSString *userAgent;
+@property (nonatomic, strong, readwrite) NSString *idfa;
 
 @property (nonatomic, strong) NSURLSession *session;
 @property (nonatomic, strong) NSDictionary *defaultParameters;
@@ -37,6 +44,7 @@
 @property (nonatomic, strong) NSMutableDictionary *overrideParameters;
 @property (nonatomic, strong) NSMutableArray *pendingRequests;
 @property (nonatomic, strong) NSTimer *queueTimer;
+@property (nonatomic, assign) NSUInteger progIndex;
 @property (assign, getter=isSending) BOOL sending;
 
 - (void)sendRequestWithParameters:(NSDictionary *)parameters date:(NSDate *)date;
@@ -63,6 +71,9 @@
     static Ganalytics *sharedInstance = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
+		// Always good to have random engine setup...
+		srandom(time(NULL));
+		
         sharedInstance = [[Ganalytics alloc] init];
     });
     return sharedInstance;
@@ -71,10 +82,14 @@
 - (instancetype)initWithTrackingID:(NSString *)trackingID {
     self = [super init];
     if (self) {
-        self.trackingID = trackingID;
-        self.useSSL = YES;
-        self.debugMode = NO;
-        
+        self.trackingID				= trackingID;
+        self.useSSL					= YES;
+        self.debugMode				= NO;
+		self.allowIDFACollection	= NO;
+		self.progIndex				= (NSUInteger)random();
+		
+		pthread_mutex_init(&mutex, NULL);
+		
         UIDevice *currentDevice = [UIDevice currentDevice];
         NSDictionary *infoDictionary = [[NSBundle mainBundle] infoDictionary];
 		
@@ -138,6 +153,11 @@
 
 - (instancetype)init {
     return [self initWithTrackingID:nil];
+}
+
+- (void)dealloc
+{
+	pthread_mutex_destroy(&mutex);
 }
 
 - (void)sendEventWithCategory:(NSString *)category
@@ -253,8 +273,11 @@
 	}
 }
 
-- (void)sendRequestWithParameters:(NSDictionary *)parameters {
+- (void)sendRequestWithParameters:(NSDictionary *)parameters
+{
+	pthread_mutex_lock(&mutex);
 	[self.pendingRequests addObject: parameters];
+	pthread_mutex_unlock(&mutex);
 }
 
 #pragma mark - Private methods
@@ -262,6 +285,8 @@
 - (void)sendRequestWithParameters:(NSDictionary *)parameters date:(NSDate *)date {
     NSParameterAssert(date);
     NSAssert(self.trackingID, @"trackingID cannot be nil");
+	
+	NSDate	*now	= [NSDate date];
 	
 	// Request this again, iOS 7 bug, see above
 	if (!self.clientID)
@@ -275,8 +300,17 @@
     [params addEntriesFromDictionary:self.customDimensions];
     [params addEntriesFromDictionary:self.customMetrics];
     [params addEntriesFromDictionary:parameters];
-    [params addEntriesFromDictionary:@{ @"qt" : [NSString stringWithFormat:@"%.0f", [[NSDate date] timeIntervalSinceDate:date] * 1000.0] }];
-    
+    [params addEntriesFromDictionary:@{ @"qt" : [NSString stringWithFormat:@"%.0f", [now timeIntervalSinceDate:date] * 1000.0],
+										@"a": [NSString stringWithFormat:@"%lu", (unsigned long)(self.progIndex++)],
+										@"ht": [NSString stringWithFormat:@"%.0f", [now timeIntervalSince1970] * 1000.0]}];
+#ifdef SUPPORT_IDFA
+	if (self.allowIDFACollection) {
+		if (!self.idfa)
+			self.idfa	= [[[ASIdentifierManager sharedManager] advertisingIdentifier].UUIDString copy];
+		[params addEntriesFromDictionary: @{@"ate":@"1", @"idfa": self.idfa}];
+	}
+#endif
+	
     NSURLRequest *request = [self requestWithParameters:params];
     if (request.HTTPBody.length > MAX_PAYLOAD_LENGTH) {
         GANLog(@"[%@] The body must be no longer than %d bytes.", NSStringFromClass([self class]), MAX_PAYLOAD_LENGTH);
@@ -290,18 +324,22 @@
 		if (self.session)
 			[[self.session dataTaskWithRequest: [self requestWithParameters:params]
 							 completionHandler: ^(NSData *data, NSURLResponse *response, NSError *error) {
+								 pthread_mutex_lock(&mutex);
 								 if (!error)
 									 [self.pendingRequests removeObjectAtIndex: 0];
 								 
 								 self.sending	= NO;
+								 pthread_mutex_unlock(&mutex);
 							 }] resume];
 		else
 			[NSURLConnection sendAsynchronousRequest: [self requestWithParameters:params]
 											   queue: [NSOperationQueue currentQueue]
 								   completionHandler: ^(NSURLResponse *response, NSData *data, NSError *connectionError) {
+									   pthread_mutex_lock(&mutex);
 									   if (!connectionError)
 										   [self.pendingRequests removeObjectAtIndex: 0];
 									   
+									   pthread_mutex_unlock(&mutex);
 									   self.sending	= NO;
 								   }];
 	} else {
@@ -311,15 +349,19 @@
 
 - (void)pickRequestFromQueue: (NSTimer *)aTimer
 {
+	pthread_mutex_lock(&mutex);
 	// Do nothing if there are no pending requests or one is being sent already
-	if (!self.pendingRequests.count || self.isSending)
+	if (!self.pendingRequests.count || self.isSending) {
+		pthread_mutex_unlock(&mutex);
 		return;
+	}
 	
 	self.sending	= YES;
 	
 	NSDictionary	*parameters	= [self.pendingRequests objectAtIndex: 0];
 	
 	[self sendRequestWithParameters: parameters date: [NSDate date]];
+	pthread_mutex_unlock(&mutex);
 }
 
 - (NSURL *)endpointURL {
@@ -358,6 +400,7 @@
 
 - (void)savePendingRequests
 {
+	pthread_mutex_lock(&mutex);
 	// Save pending requests on disk for future sending, empty queue
 	if (self.pendingRequests.count) {
 		GANLog(@"[%@] Save pending requests to disk", NSStringFromClass([self class]));
@@ -368,12 +411,14 @@
 	
 	// Queue has been removed, stop timer
 	[self.queueTimer invalidate];	self.queueTimer	= nil;
+	pthread_mutex_unlock(&mutex);
 }
 
 - (void)loadPendingRequests
 {
 	NSFileManager			*df	= [NSFileManager defaultManager];
 	
+	pthread_mutex_lock(&mutex);
 	// Load pending requests on disk that could be there
 	if ([df fileExistsAtPath: [self pendingRequestsPath]]) {
 		GANLog(@"[%@] Load pending requests from disk", NSStringFromClass([self class]));
@@ -392,6 +437,7 @@
 														 selector: @selector(pickRequestFromQueue:)
 														 userInfo: nil
 														  repeats: YES];
+	pthread_mutex_unlock(&mutex);
 }
 
 @end
@@ -401,11 +447,11 @@
 - (NSString *)gan_queryString {
     NSMutableArray *parameters = [NSMutableArray array];
     for (id key in self) {
-		NSString	*value	= (__bridge_transfer NSString *)CFURLCreateStringByAddingPercentEscapes(kCFAllocatorDefault,
-																									(CFStringRef)[[self objectForKey: key] description],
-																									NULL,
-																									CFSTR("!*'();:@&=+$,/?%#[]"),
-																									kCFStringEncodingUTF8);
+		id	value	= (__bridge_transfer NSString *)CFURLCreateStringByAddingPercentEscapes(kCFAllocatorDefault,
+																							(CFStringRef)[[self objectForKey:key] description],
+																							NULL,
+																							CFSTR("!*'();:@&=+$,/?%#[]"),
+																							kCFStringEncodingUTF8);
 		
         NSString *parameter = [NSString stringWithFormat: @"%@=%@", key, value];
         [parameters addObject:parameter];

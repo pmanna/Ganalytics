@@ -8,6 +8,8 @@
 
 #import <UIKit/UIKit.h>
 
+#define SUPPORT_IDFA	// Leaving this not commented means you've to declare you're using IDFA when submitting
+
 typedef NS_ENUM(NSInteger, GANDefaultParameter) {
     GANApplicationID,
     GANApplicationName,
@@ -18,8 +20,10 @@ typedef NS_ENUM(NSInteger, GANDefaultParameter) {
 
 @property (nonatomic, strong) NSString *trackingID;
 
-@property (nonatomic, assign) BOOL useSSL;      // YES by default
-@property (nonatomic, assign) BOOL debugMode;   // NO by deafult
+@property (nonatomic, assign) BOOL useSSL;				// YES by default
+@property (nonatomic, assign) BOOL debugMode;   		// NO by default
+@property (nonatomic, assign) BOOL allowIDFACollection;	// NO by default
+
 
 + (instancetype)sharedInstance;
 
