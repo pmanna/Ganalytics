@@ -72,7 +72,7 @@
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
 		// Always good to have random engine setup...
-		srandom(time(NULL));
+		srandom((unsigned)time(NULL));
 		
         sharedInstance = [[Ganalytics alloc] init];
     });
@@ -305,9 +305,13 @@
 										@"ht": [NSString stringWithFormat:@"%.0f", [now timeIntervalSince1970] * 1000.0]}];
 #ifdef SUPPORT_IDFA
 	if (self.allowIDFACollection) {
+		// No need to check [[ASIdentifierManager sharedManager] isAdvertisingTrackingEnabled],
+		// attribution & conversion are permitted uses
 		if (!self.idfa)
 			self.idfa	= [[[ASIdentifierManager sharedManager] advertisingIdentifier].UUIDString copy];
-		[params addEntriesFromDictionary: @{@"ate":@"1", @"idfa": self.idfa}];
+		
+		if (self.idfa)	// As above, iOS 7 bug, can still be nil
+			[params addEntriesFromDictionary: @{@"ate":@"1", @"idfa": self.idfa}];
 	}
 #endif
 	
@@ -325,7 +329,7 @@
 			[[self.session dataTaskWithRequest: [self requestWithParameters:params]
 							 completionHandler: ^(NSData *data, NSURLResponse *response, NSError *error) {
 								 pthread_mutex_lock(&mutex);
-								 if (!error)
+								 if (!error && self.pendingRequests.count)
 									 [self.pendingRequests removeObjectAtIndex: 0];
 								 
 								 self.sending	= NO;
@@ -336,7 +340,7 @@
 											   queue: [NSOperationQueue currentQueue]
 								   completionHandler: ^(NSURLResponse *response, NSData *data, NSError *connectionError) {
 									   pthread_mutex_lock(&mutex);
-									   if (!connectionError)
+									   if (!connectionError && self.pendingRequests.count)
 										   [self.pendingRequests removeObjectAtIndex: 0];
 									   
 									   pthread_mutex_unlock(&mutex);
