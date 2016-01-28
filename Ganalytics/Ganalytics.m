@@ -43,12 +43,12 @@
 @property (nonatomic, strong) NSMutableDictionary *customMetrics;
 @property (nonatomic, strong) NSMutableDictionary *overrideParameters;
 @property (nonatomic, strong) NSMutableArray *pendingRequests;
-@property (nonatomic, strong) NSTimer *queueTimer;
+@property (nonatomic, strong) dispatch_source_t queueTimer;
 @property (nonatomic, assign) NSUInteger progIndex;
 @property (assign, getter=isSending) BOOL sending;
 
 - (void)sendRequestWithParameters:(NSDictionary *)parameters date:(NSDate *)date;
-- (void)pickRequestFromQueue: (NSTimer *)aTimer;
+- (void)pickRequestFromQueue;
 - (NSURL *)endpointURL;
 - (NSURLRequest *)requestWithParameters:(NSDictionary *)parameters;
 
@@ -343,15 +343,17 @@
 									   if (!connectionError && self.pendingRequests.count)
 										   [self.pendingRequests removeObjectAtIndex: 0];
 									   
-									   pthread_mutex_unlock(&mutex);
 									   self.sending	= NO;
+									   pthread_mutex_unlock(&mutex);
 								   }];
 	} else {
+		pthread_mutex_lock(&mutex);
 		self.sending	= NO;
+		pthread_mutex_unlock(&mutex);
 	}
 }
 
-- (void)pickRequestFromQueue: (NSTimer *)aTimer
+- (void)pickRequestFromQueue
 {
 	pthread_mutex_lock(&mutex);
 	// Do nothing if there are no pending requests or one is being sent already
@@ -405,6 +407,13 @@
 - (void)savePendingRequests
 {
 	pthread_mutex_lock(&mutex);
+	
+	// Queue will be removed, stop timer
+	if (self.queueTimer != nil) {
+		dispatch_cancel(self.queueTimer);
+		self.queueTimer	= nil;
+	}
+	
 	// Save pending requests on disk for future sending, empty queue
 	if (self.pendingRequests.count) {
 		GANLog(@"[%@] Save pending requests to disk", NSStringFromClass([self class]));
@@ -413,8 +422,6 @@
 		self.pendingRequests	= nil;
 	}
 	
-	// Queue has been removed, stop timer
-	[self.queueTimer invalidate];	self.queueTimer	= nil;
 	pthread_mutex_unlock(&mutex);
 }
 
@@ -434,13 +441,23 @@
 		self.pendingRequests	= [NSMutableArray array];
 	}
 	
-	// Now that we have a queue to work on, start timer
-	if (!self.queueTimer)
-		self.queueTimer	= [NSTimer scheduledTimerWithTimeInterval: QUEUE_INTERVAL
-														   target: self
-														 selector: @selector(pickRequestFromQueue:)
-														 userInfo: nil
-														  repeats: YES];
+	// Now that we have a queue to work on, start timer on a specific GCD queue
+	if (!self.queueTimer) {
+		NSString			*queueId	= [NSString stringWithFormat: @"%@.ganalytics", [[NSBundle mainBundle] bundleIdentifier]];
+		dispatch_queue_t	t_queue		= dispatch_queue_create([queueId UTF8String], 0);
+		
+		self.queueTimer	= dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, t_queue);
+		
+		dispatch_source_set_timer(self.queueTimer, dispatch_walltime(NULL, 0),
+								  (int64_t)(QUEUE_INTERVAL * (double)NSEC_PER_SEC),
+								  (int64_t)(0.1 * (double)NSEC_PER_SEC));
+
+		dispatch_source_set_event_handler(self.queueTimer, ^{
+			[self pickRequestFromQueue];
+		});
+		
+		dispatch_resume(self.queueTimer);
+	}
 	pthread_mutex_unlock(&mutex);
 }
 
