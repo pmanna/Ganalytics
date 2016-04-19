@@ -51,6 +51,7 @@
 @property (assign, getter=isSending) BOOL sending;
 
 - (NSString *)hardwareString;
+- (void)processResponse: (NSURLResponse *)aResponse withData: (NSData *)someData error: (NSError *)error;
 - (void)sendRequestWithParameters:(NSDictionary *)parameters date:(NSDate *)date;
 - (void)pickRequestFromQueue;
 - (NSURL *)endpointURL;
@@ -314,6 +315,43 @@
 	return hardware;
 }
 
+- (void)processResponse: (NSURLResponse *)aResponse withData: (NSData *)someData error: (NSError *)error
+{
+	pthread_mutex_lock(&mutex);
+	
+#ifdef DEBUG
+	// See https://developers.google.com/analytics/devguides/collection/protocol/v1/validating-hits
+	if (someData) {
+		NSError __autoreleasing	*jsonError		= nil;
+		NSDictionary			*requestResult	= [NSJSONSerialization JSONObjectWithData: someData
+																				  options: 0
+																					error: &jsonError];
+		
+		if (!jsonError && [requestResult isKindOfClass: [NSDictionary class]]) {
+			NSArray		*hitArray	= (NSArray *)requestResult[@"hitParsingResult"];
+			
+			if ([hitArray isKindOfClass: [NSArray class]] && (hitArray.count > 0)) {
+				NSDictionary	*hitResult	= hitArray[0];
+				
+				if (![hitResult[@"valid"] boolValue])
+					NSLog(@"Wrong Ganalytics hit request: %@\n%@", hitResult[@"hit"], hitResult[@"parserMessage"]);
+			}
+		} else {
+			NSLog(@"Bad Ganalytics debug response: %@", [jsonError localizedDescription]);
+		}
+	}
+#endif
+	
+	if (error) {
+		NSLog(@"Ganalytics error: %@", [error localizedDescription]);
+	} else if (self.pendingRequests.count) {
+		[self.pendingRequests removeObjectAtIndex: 0];
+	}
+	
+	self.sending	= NO;
+	pthread_mutex_unlock(&mutex);
+}
+
 - (void)sendRequestWithParameters:(NSDictionary *)parameters date:(NSDate *)date {
     NSParameterAssert(date);
     NSAssert(self.trackingID, @"trackingID cannot be nil");
@@ -366,12 +404,7 @@
 							 completionHandler: ^(NSData *data, NSURLResponse *response, NSError *error) {
 								 strongify(self);
 								 
-								 pthread_mutex_lock(&mutex);
-								 if (!error && self.pendingRequests.count)
-									 [self.pendingRequests removeObjectAtIndex: 0];
-								 
-								 self.sending	= NO;
-								 pthread_mutex_unlock(&mutex);
+								 [self processResponse: response withData: data error: error];
 							 }] resume];
 		else
 			[NSURLConnection sendAsynchronousRequest: [self requestWithParameters:params]
@@ -379,12 +412,7 @@
 								   completionHandler: ^(NSURLResponse *response, NSData *data, NSError *connectionError) {
 									   strongify(self);
 									   
-									   pthread_mutex_lock(&mutex);
-									   if (!connectionError && self.pendingRequests.count)
-										   [self.pendingRequests removeObjectAtIndex: 0];
-									   
-									   self.sending	= NO;
-									   pthread_mutex_unlock(&mutex);
+									   [self processResponse: response withData: data error: connectionError];
 								   }];
 	} else {
 		pthread_mutex_lock(&mutex);
@@ -411,10 +439,18 @@
 }
 
 - (NSURL *)endpointURL {
+#ifdef DEBUG
+	// See https://developers.google.com/analytics/devguides/collection/protocol/v1/validating-hits
+	if (self.useSSL) {
+		return [NSURL URLWithString:@"https://ssl.google-analytics.com/debug/collect"];
+	}
+	return [NSURL URLWithString:@"https://www.google-analytics.com/debug/collect"];
+#else
     if (self.useSSL) {
         return [NSURL URLWithString:@"https://ssl.google-analytics.com/collect"];
     }
     return [NSURL URLWithString:@"http://www.google-analytics.com/collect"];
+#endif
 }
 
 - (NSURLRequest *)requestWithParameters:(NSDictionary *)parameters {
