@@ -10,6 +10,16 @@
 
 #define SUPPORT_IDFA	// Leaving this not commented means you've to declare you're using IDFA when submitting
 
+// From http://holko.pl/2015/05/31/weakify-strongify/
+#define weakify(var) __weak typeof(var) AHKWeak_##var = var;
+
+#define strongify(var) \
+	_Pragma("clang diagnostic push") \
+	_Pragma("clang diagnostic ignored \"-Wshadow\"") \
+	__strong typeof(var) var = AHKWeak_##var; \
+	_Pragma("clang diagnostic pop")
+
+
 typedef NS_ENUM(NSInteger, GANDefaultParameter) {
     GANApplicationID,
     GANApplicationName,

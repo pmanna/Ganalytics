@@ -8,6 +8,8 @@
 
 #import "Ganalytics.h"
 #import <pthread.h>
+#import <sys/types.h>
+#import <sys/sysctl.h>
 #ifdef SUPPORT_IDFA
 #import <AdSupport/AdSupport.h>
 #endif
@@ -44,9 +46,11 @@
 @property (nonatomic, strong) NSMutableDictionary *overrideParameters;
 @property (nonatomic, strong) NSMutableArray *pendingRequests;
 @property (nonatomic, strong) dispatch_source_t queueTimer;
+@property (nonatomic, assign) NSUInteger progBase;
 @property (nonatomic, assign) NSUInteger progIndex;
 @property (assign, getter=isSending) BOOL sending;
 
+- (NSString *)hardwareString;
 - (void)sendRequestWithParameters:(NSDictionary *)parameters date:(NSDate *)date;
 - (void)pickRequestFromQueue;
 - (NSURL *)endpointURL;
@@ -86,7 +90,8 @@
         self.useSSL					= YES;
         self.debugMode				= NO;
 		self.allowIDFACollection	= NO;
-		self.progIndex				= (NSUInteger)random();
+		self.progBase				= (NSUInteger)random();
+		self.progIndex				= 1;
 		
 		pthread_mutex_init(&mutex, NULL);
 		
@@ -111,12 +116,16 @@
 		
         CGRect screenBounds = [UIScreen mainScreen].bounds;
         CGFloat screenScale = [UIScreen mainScreen].scale;
-        self.defaultParameters = @{ @"v" : @1,
+        self.defaultParameters = @{ @"v"  : @1,
+									@"_v" : @"mi3.1.5",	// Simulate GAI SDK 3.1.5
+									@"_crc" : @0,		// See above, seems to always be 0
+									@"ds" : @"app",
+									@"dm" : [self hardwareString],
                                     @"aid" : infoDictionary[@"CFBundleIdentifier"],
                                     @"an" : infoDictionary[@"CFBundleName"],
                                     @"av" : infoDictionary[@"CFBundleShortVersionString"],
                                     @"ul" : [NSLocale preferredLanguages].firstObject,
-                                    @"sr" : [NSString stringWithFormat:@"%.0fx%.0f@%.fx", CGRectGetWidth(screenBounds), CGRectGetHeight(screenBounds), screenScale]};
+                                    @"sr" : [NSString stringWithFormat:@"%.0fx%.0f", CGRectGetWidth(screenBounds) * screenScale, CGRectGetHeight(screenBounds) * screenScale]};
         
         self.customDimensions	= [NSMutableDictionary dictionary];
         self.customMetrics		= [NSMutableDictionary dictionary];
@@ -126,26 +135,32 @@
 		[self loadPendingRequests];
 		
 		NSNotificationCenter		*nc	= [NSNotificationCenter defaultCenter];
-		 __weak __typeof__(self)	wself	= self;
+		
+		weakify(self);
 		
 		// Listen for app suspend, save pending requests on disk in case we have some
 		[nc addObserverForName: UIApplicationWillResignActiveNotification
 						object: nil
 						 queue: [NSOperationQueue currentQueue]
 					usingBlock: ^(NSNotification *note) {
-						if (wself.session)
-							[wself.session flushWithCompletionHandler:^{
-								[wself savePendingRequests];
+						strongify(self);
+						
+						if (self.session)
+							[self.session flushWithCompletionHandler:^{
+								[self savePendingRequests];
 							}];
 						else
-							[wself savePendingRequests];
+							[self savePendingRequests];
 					}];
+		
 		// Listen for app resume, load pending requests from disk in case we have some
 		[nc addObserverForName: UIApplicationDidBecomeActiveNotification
 						object: nil
 						 queue: [NSOperationQueue currentQueue]
 					usingBlock: ^(NSNotification *note) {
-						[wself loadPendingRequests];
+						strongify(self);
+						
+						[self loadPendingRequests];
 					}];
     }
     return self;
@@ -282,6 +297,23 @@
 
 #pragma mark - Private methods
 
+- (NSString*)hardwareString
+{
+	int			name[]	= {CTL_HW,HW_MACHINE};
+	size_t		size	= 100;
+	
+	sysctl(name, 2, NULL, &size, NULL, 0); // getting size of answer
+	
+	char		*hw_machine = malloc(size);
+	
+	sysctl(name, 2, hw_machine, &size, NULL, 0);
+	
+	NSString	*hardware	= [NSString stringWithUTF8String:hw_machine];
+	free(hw_machine);
+	
+	return hardware;
+}
+
 - (void)sendRequestWithParameters:(NSDictionary *)parameters date:(NSDate *)date {
     NSParameterAssert(date);
     NSAssert(self.trackingID, @"trackingID cannot be nil");
@@ -296,13 +328,15 @@
     [params addEntriesFromDictionary:self.overrideParameters];
     [params setObject:self.trackingID forKey:@"tid"];
 	if (self.clientID)
-		[params setObject:self.clientID forKey:@"cid"];
+		[params setObject: [self.clientID lowercaseString] forKey:@"cid"];
     [params addEntriesFromDictionary:self.customDimensions];
     [params addEntriesFromDictionary:self.customMetrics];
     [params addEntriesFromDictionary:parameters];
     [params addEntriesFromDictionary:@{ @"qt" : [NSString stringWithFormat:@"%.0f", [now timeIntervalSinceDate:date] * 1000.0],
-										@"a": [NSString stringWithFormat:@"%lu", (unsigned long)(self.progIndex++)],
+										@"a": [NSString stringWithFormat:@"%lu", (unsigned long)(self.progBase + self.progIndex)],
+										@"_s": [NSString stringWithFormat:@"%lu", (unsigned long)(self.progIndex)],
 										@"ht": [NSString stringWithFormat:@"%.0f", [now timeIntervalSince1970] * 1000.0]}];
+	self.progIndex++;
 #ifdef SUPPORT_IDFA
 	if (self.allowIDFACollection) {
 		// No need to check [[ASIdentifierManager sharedManager] isAdvertisingTrackingEnabled],
@@ -325,9 +359,13 @@
 #endif
 	
     if (!self.debugMode) {
+		weakify(self);
+		
 		if (self.session)
 			[[self.session dataTaskWithRequest: [self requestWithParameters:params]
 							 completionHandler: ^(NSData *data, NSURLResponse *response, NSError *error) {
+								 strongify(self);
+								 
 								 pthread_mutex_lock(&mutex);
 								 if (!error && self.pendingRequests.count)
 									 [self.pendingRequests removeObjectAtIndex: 0];
@@ -339,6 +377,8 @@
 			[NSURLConnection sendAsynchronousRequest: [self requestWithParameters:params]
 											   queue: [NSOperationQueue currentQueue]
 								   completionHandler: ^(NSURLResponse *response, NSData *data, NSError *connectionError) {
+									   strongify(self);
+									   
 									   pthread_mutex_lock(&mutex);
 									   if (!connectionError && self.pendingRequests.count)
 										   [self.pendingRequests removeObjectAtIndex: 0];
@@ -477,6 +517,10 @@
         NSString *parameter = [NSString stringWithFormat: @"%@=%@", key, value];
         [parameters addObject:parameter];
     }
+	
+	// Add cache buster as last parameter
+	[parameters addObject: [NSString stringWithFormat: @"z=%ld", labs(random())]];
+	
     return [parameters componentsJoinedByString:@"&"];
 }
 
